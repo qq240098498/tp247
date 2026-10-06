@@ -334,7 +334,7 @@ function listReleases(data, query) {
   if (q.batchId) rows = rows.filter((r) => r.batchId === q.batchId);
   if (q.decision) rows = rows.filter((r) => r.decision === q.decision);
   return rows
-    .map((r) => Object.assign({}, r, { batchCode: batchCode(data, r.batchId) }))
+    .map((r) => Object.assign({}, r, { batchCode: batchCode(data, r.batchId), batchReleaseId: r.batchReleaseId || '' }))
     .sort((a, b) => (a.decidedAt < b.decidedAt ? 1 : -1));
 }
 
@@ -349,9 +349,22 @@ function decide(data, batchId, payload) {
     throw new AppError(400, 'VALIDATION_FAILED', '经办人要填', { decider: '经办人不能为空' });
   }
   const check = coldlib.releaseCheck(data, batch);
+  const release = buildReleaseDoc(data, batch, check, payload, null);
+  data.releases.push(release);
+  batch.status = payload.decision === '放行' ? '已放行' : '已拒收';
+  batch.decidedAt = release.decidedAt;
+  return { release, batch: decorateBatch(data, batch) };
+}
+
+/* ---------- 批量放行 ---------- */
+
+const BATCH_RELEASE_MAX = 100;
+
+function buildReleaseDoc(data, batch, check, payload, batchReleaseId) {
   const release = {
     id: store.nextId('rl', data.releases),
     batchId: batch.id,
+    batchCode: batch.code,
     decision: payload.decision,
     decidedAt: String(payload.decidedAt || store.nowText()),
     decider: String(payload.decider).trim(),
@@ -362,10 +375,265 @@ function decide(data, batchId, payload) {
     basis: String(payload.basis || '').trim(),
     remark: String(payload.remark || ''),
   };
-  data.releases.push(release);
-  batch.status = payload.decision === '放行' ? '已放行' : '已拒收';
-  batch.decidedAt = release.decidedAt;
-  return { release, batch: decorateBatch(data, batch) };
+  if (batchReleaseId) release.batchReleaseId = batchReleaseId;
+  return release;
+}
+
+function normalizeBatchIds(raw) {
+  if (!Array.isArray(raw)) {
+    throw new AppError(400, 'VALIDATION_FAILED', '要给出 batchIds 批次清单', { batchIds: '批次清单必须是数组' });
+  }
+  const ids = raw.map((x) => String(x == null ? '' : x).trim());
+  if (!ids.length) throw new AppError(400, 'VALIDATION_FAILED', '至少选一个批次', { batchIds: '批次清单不能为空' });
+  if (ids.length > BATCH_RELEASE_MAX) {
+    throw new AppError(400, 'VALIDATION_FAILED', '一次最多放行 ' + BATCH_RELEASE_MAX + ' 批', { batchIds: '一次最多 ' + BATCH_RELEASE_MAX + ' 批' });
+  }
+  if (ids.some((x) => !x)) throw new AppError(400, 'VALIDATION_FAILED', '批次清单里有空值', { batchIds: '每一批都要有批次 id' });
+  const seen = new Set();
+  for (const id of ids) {
+    if (seen.has(id)) throw new AppError(400, 'VALIDATION_FAILED', '批次在清单里重复：' + id, { batchIds: '同一批不能在清单里出现两次' });
+    seen.add(id);
+  }
+  return ids;
+}
+
+// 预检一条批次：给出结论、被哪条判据挡下、差多少、以及本次预检的指纹
+function precheckOne(data, id, nowText) {
+  const batch = data.batches.find((b) => b.id === id);
+  const base = {
+    batchId: id,
+    batchCode: batch ? batch.code : '',
+    product: batch ? batch.product : '',
+    units: batch ? batch.units : 0,
+    roomCode: batch ? roomCode(data, batch.roomId) : '',
+    status: batch ? batch.status : '',
+    checkedAt: nowText,
+    pass: false,
+    reasons: [],
+    metrics: null,
+    fingerprint: '',
+  };
+  if (!batch) {
+    base.reasons.push({ key: 'missing', text: '批次存在', value: 0, limit: 1, unit: '批', gap: 1, gapText: '这个批次已经找不到了，可能已被删除' });
+    return base;
+  }
+  if (batch.status === '已放行' || batch.status === '已拒收') {
+    base.reasons.push({ key: 'decided', text: '批次还没做过放行/拒收决定', value: batch.status, limit: '在库或待放行', unit: '', gap: 1, gapText: '该批次已经' + batch.status + '，不能重复放行' });
+  }
+  const check = coldlib.releaseCheck(data, batch);
+  base.metrics = {
+    mkt: check.mkt,
+    longestMinutes: check.longestMinutes,
+    totalMinutes: check.totalMinutes,
+    recordCount: check.recordCount,
+    chainGapCount: check.chain.gapCount,
+  };
+  for (const c of check.conditions) {
+    if (!c.ok) {
+      base.reasons.push({ key: c.key, text: c.text, value: c.value, limit: c.limit, unit: c.unit || '', gap: c.gap, gapText: c.gapText });
+    }
+  }
+  base.pass = base.reasons.length === 0;
+  base.fingerprint = coldlib.batchFingerprint(data, batch);
+  return base;
+}
+
+// 批量预检：逐批列出结论与挡下原因，不通过的批在这里点名，不允许混进批量放行
+function batchPrecheck(data, payload) {
+  const ids = normalizeBatchIds(payload && payload.batchIds);
+  const checkedAt = store.nowText();
+  const results = ids.map((id) => precheckOne(data, id, checkedAt));
+  const blocked = results.filter((r) => !r.pass);
+  return {
+    checkedAt,
+    total: results.length,
+    passedCount: results.length - blocked.length,
+    blockedCount: blocked.length,
+    allPassed: blocked.length === 0,
+    results,
+  };
+}
+
+function failureOf(result, code, message, reason) {
+  return {
+    batchId: result.batchId,
+    batchCode: result.batchCode,
+    code,
+    message,
+    reason: reason || null,
+    reasons: result.reasons || [],
+  };
+}
+
+// 批量放行：两阶段。第一阶段只校验不落任何数据；第二阶段快照后逐批落单，落完再整体核验，任何一批失败都整体回退。
+function batchExecute(data, payload) {
+  const ids = normalizeBatchIds(payload && payload.batchIds);
+  const decider = String((payload && payload.decider) || '').trim();
+  if (!decider) {
+    throw new AppError(400, 'VALIDATION_FAILED', '经办人要填', { decider: '经办人不能为空' });
+  }
+  if (!payload || !payload.fingerprints || typeof payload.fingerprints !== 'object') {
+    throw new AppError(400, 'PRECHECK_REQUIRED', '必须带每一批的预检指纹，请先跑批量预检', { fingerprints: '缺少预检结果' });
+  }
+  const expectedFp = {};
+  for (const id of ids) {
+    const fp = String(payload.fingerprints[id] || '');
+    if (!/^[0-9a-f]{64}$/.test(fp)) {
+      throw new AppError(400, 'PRECHECK_REQUIRED', '批次 ' + id + ' 缺少有效的预检指纹，请先跑批量预检', { batchId: id });
+    }
+    expectedFp[id] = fp;
+  }
+
+  const decidedAt = String((payload && payload.decidedAt) || store.nowText());
+  const basis = String((payload && payload.basis) || '').trim() || ('批量放行：' + ids.length + ' 批预检全部通过');
+  const remark = String((payload && payload.remark) || '');
+  const precheckCheckedAt = String((payload && payload.checkedAt) || '');
+
+  // —— 第一阶段：用最新数据逐批复核，任何一批不过就整单拦下，一条数据都不落 ——
+  const failures = [];
+  const plans = [];
+  for (const id of ids) {
+    const now = precheckOne(data, id, decidedAt);
+    const batch = data.batches.find((b) => b.id === id);
+    if (!batch) { failures.push(failureOf(now, 'BATCH_NOT_FOUND', '批次已经不存在', '预检后被删除')); continue; }
+    if (batch.status === '已放行' || batch.status === '已拒收') {
+      failures.push(failureOf(now, 'BATCH_ALREADY_DECIDED', '批次已' + batch.status, '预检后这批已经被别人做过决定'));
+      continue;
+    }
+    const freshFp = coldlib.batchFingerprint(data, batch);
+    if (freshFp !== expectedFp[id]) {
+      failures.push(failureOf(now, 'BATCH_STALE', '预检结果已过期', '预检后这批的温度记录、判定口径或探头状态被改动过，请重新预检'));
+      continue;
+    }
+    if (!now.pass) {
+      failures.push(failureOf(now, 'BATCH_PRECHECK_FAILED', '最新判定已不通过', '预检后数据变了，判定结果随之变化'));
+      continue;
+    }
+    plans.push({ batch, check: coldlib.releaseCheck(data, batch) });
+  }
+
+  if (failures.length) {
+    throw new AppError(409, 'BATCH_RELEASE_ABORTED',
+      '批量放行已整体拦下：' + failures.length + ' / ' + ids.length + ' 批不能放行，没有任何一批被放行，请处理后重新预检',
+      { aborted: true, rolledBack: true, releasedCount: 0, total: ids.length, failures });
+  }
+
+  // —— 第二阶段：快照 → 逐批落单 → 整体核验；中途或核验失败就回滚到快照 ——
+  const snapshot = JSON.stringify({
+    batches: data.batches.map((b) => Object.assign({}, b)),
+    releases: data.releases.map((r) => Object.assign({}, r)),
+    batchReleases: data.batchReleases.map((x) => x),
+  });
+  const rollback = (err) => {
+    const saved = JSON.parse(snapshot);
+    data.batches = saved.batches;
+    data.releases = saved.releases;
+    data.batchReleases = saved.batchReleases;
+    throw err;
+  };
+
+  const orderId = store.nextId('br', data.batchReleases);
+  const items = [];
+  try {
+    for (const plan of plans) {
+      const docPayload = { decision: '放行', decidedAt, decider, basis, remark };
+      const release = buildReleaseDoc(data, plan.batch, plan.check, docPayload, orderId);
+      data.releases.push(release);
+      plan.batch.status = '已放行';
+      plan.batch.decidedAt = decidedAt;
+      items.push({
+        batchId: plan.batch.id,
+        batchCode: plan.batch.code,
+        product: plan.batch.product,
+        units: plan.batch.units,
+        roomCode: roomCode(data, plan.batch.roomId),
+        releaseId: release.id,
+        decidedAt: release.decidedAt,
+        decider: release.decider,
+        mkt: release.mkt,
+        longestExcursionMinutes: release.longestExcursionMinutes,
+        totalExcursionMinutes: release.totalExcursionMinutes,
+        chainGapCount: release.chainGapCount,
+        basis: release.basis,
+      });
+    }
+
+    // 落单后的整体核验：每批必须已放行，每张放行单必须在
+    const verifyFailures = [];
+    for (const item of items) {
+      const batch = data.batches.find((b) => b.id === item.batchId);
+      const release = data.releases.find((r) => r.id === item.releaseId);
+      if (!batch || batch.status !== '已放行' || !release || release.decision !== '放行') {
+        verifyFailures.push({ batchId: item.batchId, batchCode: item.batchCode, code: 'BATCH_RELEASE_VERIFY_FAILED', message: '落单后核验不到放行结果' });
+      }
+    }
+    if (verifyFailures.length) {
+      rollback(new AppError(500, 'BATCH_RELEASE_ROLLED_BACK',
+        '批量放行落单后核验失败，已整体回退，没有任何一批被放行',
+        { rolledBack: true, releasedCount: 0, total: ids.length, failures: verifyFailures }));
+    }
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    rollback(new AppError(500, 'BATCH_RELEASE_ROLLED_BACK',
+      '批量放行执行到一半出错，已整体回退，没有任何一批被放行：' + err.message,
+      { rolledBack: true, releasedCount: 0, total: ids.length }));
+  }
+
+  const order = {
+    id: orderId,
+    decidedAt,
+    decider,
+    basis,
+    remark,
+    precheckCheckedAt,
+    total: items.length,
+    successCount: items.length,
+    failedCount: 0,
+    totalUnits: items.reduce((a, x) => a + Number(x.units || 0), 0),
+    status: '全部放行',
+    items,
+  };
+  data.batchReleases.push(order);
+
+  return {
+    order,
+    summary: {
+      total: order.total,
+      successCount: order.successCount,
+      failedCount: 0,
+      rolledBack: false,
+      decider,
+      decidedAt,
+      orderId,
+    },
+    results: items.map((x) => ({ batchId: x.batchId, batchCode: x.batchCode, releaseId: x.releaseId, ok: true, decidedAt: x.decidedAt })),
+  };
+}
+
+function decorateBatchRelease(data, order) {
+  return Object.assign({}, order, {
+    items: (order.items || []).map((x) => {
+      const batch = data.batches.find((b) => b.id === x.batchId);
+      return Object.assign({}, x, {
+        batchCode: x.batchCode || batchCode(data, x.batchId),
+        roomCode: x.roomCode || (batch ? roomCode(data, batch.roomId) : ''),
+      });
+    }),
+  });
+}
+
+function listBatchReleases(data, query) {
+  const q = query || {};
+  let rows = data.batchReleases.slice();
+  if (q.batchId) rows = rows.filter((o) => (o.items || []).some((x) => x.batchId === q.batchId));
+  if (q.decider) rows = rows.filter((o) => String(o.decider || '').includes(q.decider));
+  return rows.map((o) => decorateBatchRelease(data, o)).sort((a, b) => (a.decidedAt < b.decidedAt ? 1 : -1));
+}
+
+function batchReleaseDetail(data, id) {
+  const order = data.batchReleases.find((o) => o.id === id);
+  if (!order) throw new AppError(404, 'BATCH_RELEASE_NOT_FOUND', '这张批量放行单不存在');
+  return decorateBatchRelease(data, order);
 }
 
 module.exports = {
@@ -374,5 +642,6 @@ module.exports = {
   listBatches, batchDetail, createBatch, updateBatch, removeBatch,
   listRecords, createRecord, removeRecord,
   listReleases, decide,
+  batchPrecheck, batchExecute, listBatchReleases, batchReleaseDetail,
   ROOM_STATUS, ROOM_TYPE, PROBE_STATUS, BATCH_STATUS, SOURCE_LIST,
 };

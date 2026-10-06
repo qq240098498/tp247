@@ -20,12 +20,16 @@ const state = {
   batchesView: [],
   recordsView: [],
   releasesView: [],
+  batchOrdersView: [],
   roomDetail: {},
   batchDetail: {},
   batchOut: {},
   batchDetailError: {},
   expandedRooms: new Set(),
   expandedBatches: new Set(),
+  expandedOrders: new Set(),
+  selectedBatches: new Set(),
+  bulk: null,
   filters: {
     rooms: { status: '', type: '', keyword: '', probeStatus: '', probeCal: 'all' },
     batches: { status: '', roomId: '', product: '', noRecord: false },
@@ -138,6 +142,7 @@ function closeModal() {
   $('modalMask').hidden = true;
   modalOnOk = null;
   $('modalBody').innerHTML = '';
+  document.querySelector('.modal').classList.remove('modal-wide');
   markErrorFields(null);
 }
 
@@ -369,11 +374,16 @@ function renderBatchRows() {
   const rows = state.batchesView || [];
   const tbody = $('batchRows');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="13" class="empty">没有符合条件的批次</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="14" class="empty">没有符合条件的批次</td></tr>';
+    updateBulkBar();
     return;
   }
   tbody.innerHTML = rows.map(function (b) {
-    const main = '<tr class="row-main" data-rowkind="batch" data-id="' + esc(b.id) + '">' +
+    const selectable = b.status === '在库' || b.status === '待放行';
+    const checked = state.selectedBatches.has(b.id) ? ' checked' : '';
+    const checkCell = '<td class="col-check" data-noexpand="1"><input type="checkbox" class="batch-check" data-id="' + esc(b.id) + '"' + checked + (selectable ? '' : ' disabled title="只有在库/待放行的批次能批量放行"') + '></td>';
+    const main = '<tr class="row-main' + (selectable ? ' row-selectable' : '') + '" data-rowkind="batch" data-id="' + esc(b.id) + '">' +
+      checkCell +
       '<td>' + esc(b.code) + '</td>' +
       '<td>' + esc(b.product) + '</td>' +
       '<td>' + esc(b.spec) + '</td>' +
@@ -391,11 +401,27 @@ function renderBatchRows() {
     if (!state.expandedBatches.has(b.id)) return main;
     return main + batchDetailRow(b);
   }).join('');
+  updateBulkBar();
+}
+
+function updateBulkBar() {
+  const rows = state.batchesView || [];
+  const selectable = rows.filter(function (b) { return b.status === '在库' || b.status === '待放行'; });
+  const selected = selectable.filter(function (b) { return state.selectedBatches.has(b.id); });
+  const hint = $('bulkSelectedHint');
+  const btn = $('bulkReleaseBtn');
+  if (hint) hint.textContent = '已选 ' + selected.length + ' / 可批量放行 ' + selectable.length + ' 批';
+  if (btn) btn.disabled = selected.length === 0;
+  const all = $('batchSelectAll');
+  if (all) {
+    all.checked = selectable.length > 0 && selected.length === selectable.length;
+    all.indeterminate = selected.length > 0 && selected.length < selectable.length;
+  }
 }
 
 function batchDetailRow(b) {
   const d = state.batchDetail[b.id];
-  if (!d) return '<tr class="row-detail"><td colspan="13"><div class="detail-note">正在读取批次详情…</div></td></tr>';
+  if (!d) return '<tr class="row-detail"><td colspan="14"><div class="detail-note">正在读取批次详情…</div></td></tr>';
   const out = state.batchOut[b.id] || {};
 
   const records = (d.records || []).map(function (r) {
@@ -424,12 +450,12 @@ function batchDetailRow(b) {
   }).join('') || '<tr><td colspan="4" class="empty">没有断链缺口</td></tr>';
 
   const check = d.releaseCheck || {};
-  const conds = (check.conditions || []).slice();
+  const conds = check.conditions || [];
   const expired = check.expiredProbes || [];
-  conds.push({ key: 'calibration', ok: expired.length === 0, value: expired.length, limit: 0, text: '参与判定的探头都在校准有效期内' });
   const condHtml = conds.map(function (c) {
-    return '<li><span class="cond-text">' + okPill(c.ok) + ' ' + esc(c.text) + '</span>' +
-      '<span class="cond-meta">实际 ' + esc(c.value) + '，阈值 ' + esc(c.limit) + '</span></li>';
+    const meta = '<span class="cond-meta">实际 ' + esc(c.value) + (c.unit ? ' ' + esc(c.unit) : '') + '，阈值 ' + esc(c.limit) + '</span>';
+    const gap = c.ok ? '' : '<div class="cond-gap">✗ ' + esc(c.gapText || '不满足') + '</div>';
+    return '<li><div><span class="cond-text">' + okPill(c.ok) + ' ' + esc(c.text) + '</span>' + gap + '</div>' + meta + '</li>';
   }).join('');
 
   const expiredProbes = expired.map(function (p) {
@@ -447,7 +473,7 @@ function batchDetailRow(b) {
     '<button type="button" class="btn btn-danger" data-action="batch-del" data-id="' + esc(b.id) + '">删除</button>' +
     '</div>';
 
-  return '<tr class="row-detail"><td colspan="13">' +
+  return '<tr class="row-detail"><td colspan="14">' +
     '<div class="detail-grid">' +
     '<div class="detail-block"><h4>温度记录（' + (d.records || []).length + '）</h4>' +
     '<table class="mini-table"><thead><tr><th>时刻</th><th>探头</th><th class="num">温度(℃)</th><th>来源</th><th>是否超限</th><th>探头是否过期</th></tr></thead><tbody>' + records + '</tbody></table></div>' +
@@ -558,11 +584,16 @@ async function loadReleasesView() {
   const f = state.filters.releases;
   const params = new URLSearchParams();
   if (f.decision) params.set('decision', f.decision);
-  const rows = await api('GET', '/api/releases' + (params.toString() ? '?' + params.toString() : ''));
+  const [rows, orders] = await Promise.all([
+    api('GET', '/api/releases' + (params.toString() ? '?' + params.toString() : '')),
+    api('GET', '/api/batch-releases')
+  ]);
   state.releasesView = rows;
+  state.batchOrdersView = orders || [];
+  renderBatchOrderRows();
   const s = state.summary;
   if (s) {
-    $('releasesNote').textContent = '放行 ' + num(s.releasedCount) + ' 条，拒收 ' + num(s.rejectedCount) + ' 条';
+    $('releasesNote').textContent = '放行 ' + num(s.releasedCount) + ' 条，拒收 ' + num(s.rejectedCount) + ' 条（其中批量放行单 ' + (orders || []).length + ' 张）';
   } else {
     const rel = rows.filter(function (r) { return r.decision === '放行'; }).length;
     const rej = rows.filter(function (r) { return r.decision === '拒收'; }).length;
@@ -570,7 +601,7 @@ async function loadReleasesView() {
   }
   const tbody = $('releaseRows');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="10" class="empty">没有符合条件的放行记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">没有符合条件的放行记录</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function (r) {
@@ -583,10 +614,54 @@ async function loadReleasesView() {
       '<td class="num">' + num(r.longestExcursionMinutes) + '</td>' +
       '<td class="num">' + num(r.totalExcursionMinutes) + '</td>' +
       '<td class="num">' + num(r.chainGapCount) + '</td>' +
+      '<td>' + (r.batchReleaseId ? pill(r.batchReleaseId, 'pill-mute') : '<span class="detail-note">单批</span>') + '</td>' +
       '<td>' + esc(r.basis) + '</td>' +
       '<td>' + esc(r.remark) + '</td>' +
       '</tr>';
   }).join('');
+}
+
+function renderBatchOrderRows() {
+  const tbody = $('batchOrderRows');
+  if (!tbody) return;
+  const rows = state.batchOrdersView || [];
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">还没有批量放行单</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(function (o) {
+    const main = '<tr class="row-main row-selectable" data-rowkind="batch-order" data-id="' + esc(o.id) + '">' +
+      '<td>' + esc(o.id) + '</td>' +
+      '<td>' + esc(o.decidedAt) + '</td>' +
+      '<td>' + esc(o.decider) + '</td>' +
+      '<td class="num">' + num(o.total) + '</td>' +
+      '<td class="num">' + num(o.totalUnits) + '</td>' +
+      '<td class="num">' + num(o.successCount) + '</td>' +
+      '<td class="num">' + num(o.failedCount) + '</td>' +
+      '<td>' + pill(o.status, 'pill-ok') + '</td>' +
+      '<td>' + esc(o.precheckCheckedAt || '—') + '</td>' +
+      '<td>' + esc(o.basis) + '</td>' +
+      '<td><button type="button" class="btn btn-sm" data-action="batch-order-detail" data-id="' + esc(o.id) + '">明细</button></td>' +
+      '</tr>';
+    if (!state.expandedOrders.has(o.id)) return main;
+    const items = (o.items || []).map(function (x, i) {
+      return '<tr><td class="num">' + (i + 1) + '</td><td>' + esc(x.batchCode) + '</td><td>' + esc(x.product) + '</td>' +
+        '<td>' + esc(x.roomCode) + '</td><td class="num">' + num(x.units) + '</td><td>' + pill('已放行', 'pill-ok') + '</td>' +
+        '<td>' + esc(x.releaseId) + '</td><td>' + esc(x.decidedAt) + '</td>' +
+        '<td class="num">' + num(x.mkt) + '</td><td class="num">' + num(x.longestExcursionMinutes) + '</td>' +
+        '<td class="num">' + num(x.totalExcursionMinutes) + '</td><td class="num">' + num(x.chainGapCount) + '</td></tr>';
+    }).join('') || '<tr><td colspan="12" class="empty">空单</td></tr>';
+    const detail = '<tr class="row-detail"><td colspan="11"><div class="detail-block"><h4>' + esc(o.id) + ' 批次清单（' + (o.items || []).length + '）</h4>' +
+      '<table class="mini-table"><thead><tr><th>#</th><th>批次号</th><th>品名</th><th>冷库</th><th class="num">件数</th><th>结果</th>' +
+      '<th>放行单号</th><th>放行时刻</th><th class="num">MKT</th><th class="num">最长超限</th><th class="num">累计超限</th><th class="num">断链</th></tr></thead><tbody>' +
+      items + '</tbody></table></div></td></tr>';
+    return main + detail;
+  }).join('');
+}
+
+function toggleOrder(id) {
+  if (state.expandedOrders.has(id)) { state.expandedOrders.delete(id); renderBatchOrderRows(); }
+  else { state.expandedOrders.add(id); renderBatchOrderRows(); }
 }
 
 /* ---------- 左侧筛选栏 ---------- */
@@ -756,10 +831,245 @@ function openDecisionModal(batch, decision) {
   });
 }
 
+/* ---------- 批量预检放行向导 ---------- */
+
+const BULK_STAGE = { META: 'meta', PRECHECK: 'precheck', RESULT: 'result', FAILED: 'failed' };
+
+function selectedBatchIds() {
+  return (state.batchesView || [])
+    .filter(function (b) { return (b.status === '在库' || b.status === '待放行') && state.selectedBatches.has(b.id); })
+    .map(function (b) { return b.id; });
+}
+
+function openBulkWizard() {
+  const ids = selectedBatchIds();
+  if (!ids.length) return;
+  document.querySelector('.modal').classList.add('modal-wide');
+  state.bulk = { ids: ids, precheck: null, meta: { decider: '', basis: '', remark: '' }, stage: BULK_STAGE.META, result: null, error: null };
+  renderBulkStage();
+}
+
+function setModalButtons(okText, onOk, okDisabled, cancelText) {
+  const ok = $('modalOk');
+  const cancel = $('modalCancel');
+  ok.textContent = okText;
+  ok.disabled = !!okDisabled;
+  ok.hidden = false;
+  cancel.textContent = cancelText || '取消';
+  cancel.hidden = false;
+  modalOnOk = onOk;
+}
+
+function bulkMetaHtml() {
+  const m = state.bulk.meta;
+  return '<div class="bulk-intro">共选中 <b>' + state.bulk.ids.length + '</b> 批。先统一填写经办信息并跑预检；预检逐批给出结论与挡下原因，全部通过后才允许批量放行。</div>' +
+    '<div class="field"><label>经办人 *</label><input type="text" data-field="decider" value="' + esc(m.decider) + '"></div>' +
+    '<div class="field"><label>放行依据（批量单共用）</label><input type="text" data-field="basis" value="' + esc(m.basis) + '" placeholder="留空则记为「批量放行：N 批预检全部通过」"></div>' +
+    '<div class="field"><label>备注</label><textarea data-field="remark">' + esc(m.remark) + '</textarea></div>' +
+    '<div class="field-hint">预检不通过的批次不能混入放行；放行时若任一批失败会整体回退，不会出现放了一半的情况。</div>';
+}
+
+function collectBulkMeta() {
+  const v = formValues();
+  state.bulk.meta = { decider: (v.decider || '').trim(), basis: (v.basis || '').trim(), remark: (v.remark || '').trim() };
+}
+
+function reasonLine(rs) {
+  const parts = (rs || []).map(function (r) {
+    return '<li><span class="reason-key">' + esc(r.key) + '</span> ' + esc(r.gapText || r.text || '不满足') +
+      ' <span class="cond-meta">（实际 ' + esc(r.value) + (r.unit ? ' ' + esc(r.unit) : '') + ' / 阈值 ' + esc(r.limit) + '）</span></li>';
+  }).join('');
+  return parts ? '<ul class="reason-list">' + parts + '</ul>' : '<div class="detail-note">无</div>';
+}
+
+function bulkPrecheckRows(results) {
+  return results.map(function (r, i) {
+    const cls = r.pass ? 'bulk-row-ok' : 'bulk-row-bad';
+    const verdict = r.pass ? pill('预检通过', 'pill-ok') : pill('被挡下', 'pill-bad');
+    const m = r.metrics || {};
+    return '<tr class="' + cls + '">' +
+      '<td class="num">' + (i + 1) + '</td>' +
+      '<td>' + esc(r.batchCode) + '</td>' +
+      '<td>' + esc(r.product) + '</td>' +
+      '<td>' + esc(r.roomCode) + '</td>' +
+      '<td class="num">' + num(m.recordCount) + '</td>' +
+      '<td class="num">' + num(m.longestMinutes) + '</td>' +
+      '<td class="num">' + num(m.totalMinutes) + '</td>' +
+      '<td class="num">' + num(m.chainGapCount) + '</td>' +
+      '<td class="num">' + num(m.mkt) + '</td>' +
+      '<td>' + verdict + (r.pass ? '' : reasonLine(r.reasons)) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+function bulkPrecheckTable(pc) {
+  return '<div class="table-wrap bulk-table-wrap"><table class="mini-table bulk-table"><thead><tr>' +
+    '<th>#</th><th>批次号</th><th>品名</th><th>冷库</th><th class="num">记录数</th>' +
+    '<th class="num">最长超限(分)</th><th class="num">累计超限(分)</th><th class="num">断链</th><th class="num">MKT</th><th>预检结论 / 挡下原因（判据与差值）</th>' +
+    '</tr></thead><tbody>' + bulkPrecheckRows(pc.results) + '</tbody></table></div>';
+}
+
+function renderBulkStage() {
+  const bulk = state.bulk;
+  if (bulk.stage === BULK_STAGE.META) {
+    $('modalTitle').textContent = '批量预检放行（1/3 经办信息）';
+    $('modalBody').innerHTML = bulkMetaHtml();
+    setModalButtons('开始预检', runBulkPrecheck, false, '取消');
+    focusFirstField();
+    return;
+  }
+  if (bulk.stage === BULK_STAGE.PRECHECK) {
+    const pc = bulk.precheck;
+    $('modalTitle').textContent = '批量预检放行（2/3 预检结论）';
+    const head = pc.allPassed
+      ? '<div class="bulk-banner bulk-banner-ok">预检时刻 ' + esc(pc.checkedAt) + '：' + pc.total + ' 批全部通过，可以批量放行。放行时服务端会再次逐批复核。</div>'
+      : '<div class="bulk-banner bulk-banner-bad">预检时刻 ' + esc(pc.checkedAt) + '：' + pc.passedCount + ' 批通过，' + pc.blockedCount + ' 批被挡下。被挡下的批不许混进批量放行——请取消勾选它们后对剩余批次重新预检，或先处理问题。</div>';
+    const metaLine = '<div class="field-hint">经办人：' + esc(bulk.meta.decider) + '｜依据：' + esc(bulk.meta.basis || ('批量放行：' + pc.total + ' 批预检全部通过')) + '</div>';
+    $('modalBody').innerHTML = head + metaLine + bulkPrecheckTable(pc);
+    if (pc.allPassed) setModalButtons('确认批量放行 ' + pc.passedCount + ' 批', executeBulkRelease, false, '返回修改');
+    else setModalButtons('重新预检', runBulkPrecheck, false, '关闭去勾选/处理');
+    return;
+  }
+  if (bulk.stage === BULK_STAGE.RESULT) { renderBulkResult(); return; }
+  if (bulk.stage === BULK_STAGE.FAILED) renderBulkFailed();
+}
+
+function focusFirstField() {
+  const first = $('modalBody').querySelector('input,select,textarea');
+  if (first) setTimeout(function () { first.focus(); }, 20);
+}
+
+async function runBulkPrecheck() {
+  const bulk = state.bulk;
+  collectBulkMeta();
+  if (!bulk.meta.decider) { showError({ message: '经办人不能为空' }); return; }
+  const ok = $('modalOk');
+  ok.disabled = true;
+  ok.textContent = '预检中…';
+  try {
+    bulk.precheck = await api('POST', '/api/batch-release/precheck', { batchIds: bulk.ids });
+    bulk.stage = BULK_STAGE.PRECHECK;
+    renderBulkStage();
+  } catch (err) {
+    ok.disabled = false;
+    ok.textContent = '开始预检';
+    showError(err);
+  }
+}
+
+function fingerprintsFromPrecheck(pc) {
+  const out = {};
+  (pc.results || []).forEach(function (r) { out[r.batchId] = r.fingerprint; });
+  return out;
+}
+
+async function executeBulkRelease() {
+  const bulk = state.bulk;
+  const pc = bulk.precheck;
+  const ok = $('modalOk');
+  ok.disabled = true;
+  ok.textContent = '批量放行中…';
+  $('modalCancel').hidden = true;
+  try {
+    const out = await api('POST', '/api/batch-release/execute', {
+      batchIds: bulk.ids,
+      decider: bulk.meta.decider,
+      basis: bulk.meta.basis,
+      remark: bulk.meta.remark,
+      checkedAt: pc.checkedAt,
+      fingerprints: fingerprintsFromPrecheck(pc)
+    });
+    bulk.result = out;
+    bulk.stage = BULK_STAGE.RESULT;
+    renderBulkStage();
+  } catch (err) {
+    bulk.error = err;
+    bulk.stage = BULK_STAGE.FAILED;
+    renderBulkStage();
+  }
+}
+
+function renderBulkResult() {
+  const order = state.bulk.result.order;
+  const items = order.items || [];
+  $('modalTitle').textContent = '批量预检放行（3/3 完成）';
+  const rows = items.map(function (x, i) {
+    return '<tr class="bulk-row-ok">' +
+      '<td class="num">' + (i + 1) + '</td><td>' + esc(x.batchCode) + '</td><td>' + esc(x.product) + '</td>' +
+      '<td>' + esc(x.roomCode) + '</td><td class="num">' + num(x.units) + '</td>' +
+      '<td>' + pill('已放行', 'pill-ok') + '</td>' +
+      '<td>' + esc(x.releaseId) + '</td><td>' + esc(x.decidedAt) + '</td><td>' + esc(x.decider) + '</td>' +
+      '<td class="num">' + num(x.mkt) + '</td><td class="num">' + num(x.longestExcursionMinutes) + '</td>' +
+      '<td class="num">' + num(x.totalExcursionMinutes) + '</td><td class="num">' + num(x.chainGapCount) + '</td>' +
+      '</tr>';
+  }).join('');
+  const table = '<div class="table-wrap bulk-table-wrap"><table class="mini-table bulk-table"><thead><tr>' +
+    '<th>#</th><th>批次号</th><th>品名</th><th>冷库</th><th class="num">件数</th><th>结果</th>' +
+    '<th>放行单号</th><th>放行时刻</th><th>经办人</th><th class="num">MKT</th>' +
+    '<th class="num">最长超限</th><th class="num">累计超限</th><th class="num">断链</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+  const summary = '<div class="bulk-banner bulk-banner-ok">' +
+    '批量放行单 <b>' + esc(order.id) + '</b> 已生成：共 ' + order.total + ' 批、' + num(order.totalUnits) + ' 件，全部放行成功，经办人 ' + esc(order.decider) + '，时刻 ' + esc(order.decidedAt) + '。每批均已生成独立放行单。' +
+    '</div>';
+  $('modalBody').innerHTML = summary +
+    '<div class="field-hint">依据：' + esc(order.basis || '') + (order.remark ? '｜备注：' + esc(order.remark) : '') + '</div>' + table;
+  setModalButtons('完成', finishBulkWizard, false, '');
+  $('modalCancel').hidden = true;
+}
+
+function renderBulkFailed() {
+  const bulk = state.bulk;
+  const err = bulk.error || {};
+  const d = err.details || {};
+  const failures = d.failures || [];
+  $('modalTitle').textContent = '批量放行未执行';
+  const rolled = d.rolledBack || d.aborted;
+  const banner = '<div class="bulk-banner bulk-banner-bad">' +
+    '<b>' + esc(err.message || '批量放行失败') + '</b>' +
+    '<div class="bulk-sub">错误码 ' + esc(err.code || '') + '；本次放行 ' + num(d.releasedCount) + ' 批' +
+    (rolled ? '，已整体回退，没有任何一批被放行' : '') + '。</div></div>';
+  let body = banner;
+  if (failures.length) {
+    const rows = failures.map(function (f, i) {
+      const stale = f.code === 'BATCH_STALE' || f.code === 'BATCH_PRECHECK_FAILED';
+      return '<tr class="bulk-row-bad"><td class="num">' + (i + 1) + '</td><td>' + esc(f.batchCode || f.batchId) + '</td>' +
+        '<td>' + pill(f.code, 'pill-bad') + '</td><td>' + esc(f.message || '') + '<td>' + esc(f.reason || '') + (stale ? '<div class="cond-gap">需重新预检后才能放行</div>' : '') + reasonLine(f.reasons) + '</td></tr>';
+    }).join('');
+    body += '<div class="bulk-fail-title">导致整单拦下 / 回退的批次：</div>' +
+      '<div class="table-wrap bulk-table-wrap"><table class="mini-table bulk-table"><thead><tr><th>#</th><th>批次号</th><th>错误码</th><th>说明</th><th>原因（哪一条判据、差多少）</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+  }
+  body += '<div class="field-hint">预检结果已作废，请点「重新预检」用最新数据重跑；在这之前不会放行任何一批。</div>';
+  $('modalBody').innerHTML = body;
+  setModalButtons('重新预检', rerunBulkPrecheck, false, '关闭');
+}
+
+async function rerunBulkPrecheck() {
+  const bulk = state.bulk;
+  const ok = $('modalOk');
+  ok.disabled = true;
+  ok.textContent = '预检中…';
+  try {
+    bulk.precheck = await api('POST', '/api/batch-release/precheck', { batchIds: bulk.ids });
+    bulk.stage = BULK_STAGE.PRECHECK;
+    bulk.error = null;
+    renderBulkStage();
+  } catch (err) {
+    ok.disabled = false;
+    ok.textContent = '重新预检';
+    showError(err);
+  }
+}
+
+async function finishBulkWizard() {
+  const okIds = new Set((state.bulk.result.results || []).map(function (r) { return r.batchId; }));
+  state.selectedBatches = new Set(Array.from(state.selectedBatches).filter(function (id) { return !okIds.has(id); }));
+  state.bulk = null;
+  closeModal();
+  await refreshAfterMutation();
+}
+
 function openRecordForm() {
   const now = state.summary && state.summary.today ? state.summary.today + ' 00:00:00' : '';
-  const body =
-    '<div class="field"><label>批次</label><select data-field="batchId">' + batchOptions('') + '</select></div>' +
+  const body =    '<div class="field"><label>批次</label><select data-field="batchId">' + batchOptions('') + '</select></div>' +
     '<div class="field"><label>探头</label><select data-field="probeId">' + probeOptions('') + '</select></div>' +
     '<div class="field"><label>时刻</label><input type="text" data-field="at" value="' + esc(now) + '" placeholder="2026-09-01 08:00:00"></div>' +
     '<div class="field"><label>温度（℃）</label><input type="number" step="0.1" data-field="temperatureC" value=""></div>' +
@@ -876,6 +1186,8 @@ async function handleAction(action, el) {
       if (batch) openDecisionModal(batch, action === 'batch-release' ? '放行' : '拒收');
       return;
     }
+    if (action === 'batch-bulk') { openBulkWizard(); return; }
+    if (action === 'batch-order-detail') { toggleOrder(el.dataset.id); return; }
     if (action === 'batch-del') {
       const id = el.dataset.id;
       armDelete(el, async function () {
@@ -912,7 +1224,9 @@ async function toggleExpand(kind, id) {
     if (kind === 'batch') {
       if (state.expandedBatches.has(id)) { state.expandedBatches.delete(id); renderBatchRows(); }
       else await expandBatch(id);
+      return;
     }
+    if (kind === 'batch-order') { toggleOrder(id); }
   } catch (err) { showError(err); }
 }
 
@@ -920,23 +1234,49 @@ document.body.addEventListener('click', function (e) {
   const tab = e.target.closest('.tab');
   if (tab && tab.dataset.view) { switchView(tab.dataset.view); return; }
 
+  // 批次多选：点勾选框只改选中，不展开行
+  const check = e.target.closest('.batch-check');
+  if (check) {
+    const id = check.dataset.id;
+    if (check.checked) state.selectedBatches.add(id);
+    else state.selectedBatches.delete(id);
+    updateBulkBar();
+    return;
+  }
+  const selectAll = e.target.closest('#batchSelectAll');
+  if (selectAll) {
+    const rows = (state.batchesView || []).filter(function (b) { return b.status === '在库' || b.status === '待放行'; });
+    state.selectedBatches = new Set(selectAll.checked ? rows.map(function (b) { return b.id; }) : []);
+    renderBatchRows();
+    return;
+  }
+
   const actionEl = e.target.closest('[data-action]');
   if (actionEl) { handleAction(actionEl.dataset.action, actionEl); return; }
 
   const row = e.target.closest('tr.row-main');
-  if (row && row.dataset.rowkind) { toggleExpand(row.dataset.rowkind, row.dataset.id); }
+  if (row && row.dataset.rowkind && !e.target.closest('[data-noexpand]')) { toggleExpand(row.dataset.rowkind, row.dataset.id); }
 });
 
 $('filters').addEventListener('change', onFilterInput);
 $('filters').addEventListener('input', onFilterInput);
 
-$('modalClose').addEventListener('click', closeModal);
-$('modalCancel').addEventListener('click', closeModal);
+$('modalClose').addEventListener('click', function () { state.bulk = null; closeModal(); });
+$('modalCancel').addEventListener('click', function () {
+  // 批量向导里预检通过后的「返回修改」：回到经办信息步，保留已填内容
+  if (state.bulk && state.bulk.stage === BULK_STAGE.PRECHECK && state.bulk.precheck && state.bulk.precheck.allPassed) {
+    state.bulk.stage = BULK_STAGE.META;
+    renderBulkStage();
+    return;
+  }
+  state.bulk = null;
+  closeModal();
+});
 $('modalOk').addEventListener('click', function () {
   if (modalOnOk) modalOnOk();
 });
 $('modalMask').addEventListener('click', function (e) {
-  if (e.target === $('modalMask')) closeModal();
+  if (e.target === $('modalMask')) { state.bulk = null; closeModal(); }
 });
 
 /* ---------- 启动 ---------- */

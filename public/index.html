@@ -96,12 +96,17 @@
         <div class="panel">
           <div class="panel-head">
             <h2>批次清单</h2>
-            <span class="panel-hint">点一行展开温度记录、超限段、断链与放行判定</span>
+            <div class="panel-head-actions">
+              <span class="panel-hint" id="bulkSelectedHint">未选择批次</span>
+              <button type="button" class="btn btn-primary" data-action="batch-bulk" id="bulkReleaseBtn" disabled>批量预检放行</button>
+            </div>
           </div>
+          <div class="bulk-note">勾选多批后点「批量预检放行」：先逐批预检、列出被哪条判据挡下、差多少；全部通过并确认后才批量放行。预检不通过的批混不进去，放行时任一批失败会整体回退。</div>
           <div class="table-wrap">
             <table class="data-table">
               <thead>
                 <tr>
+                  <th class="col-check"><input type="checkbox" id="batchSelectAll" title="全选当前在办批次"></th>
                   <th>批次号</th><th>品名</th><th>规格</th><th class="num">件数</th><th>所在冷库</th>
                   <th>入库时刻</th><th>状态</th><th class="num">记录数</th><th class="num">最长超限</th>
                   <th class="num">累计超限</th><th class="num">MKT</th><th class="num">断链数</th><th>放行情况</th>
@@ -137,6 +142,25 @@
       <div class="view" data-view="releases" id="view-releases">
         <div class="panel">
           <div class="panel-head">
+            <h2>批量放行单</h2>
+            <span class="panel-hint" id="batchOrdersNote">每次批量放行生成一张清单级单据</span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>批量单号</th><th>放行时刻</th><th>经办人</th><th class="num">批次数</th>
+                  <th class="num">件数合计</th><th class="num">成功</th><th class="num">失败/回退</th>
+                  <th>结果</th><th>预检时刻</th><th>依据</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="batchOrderRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
             <h2>放行台账</h2>
             <span class="panel-hint" id="releasesNote"></span>
           </div>
@@ -146,7 +170,7 @@
                 <tr>
                   <th>批次</th><th>决定</th><th>时刻</th><th>经办人</th><th class="num">当时的 MKT</th>
                   <th class="num">最长超限</th><th class="num">累计超限</th><th class="num">断链数</th>
-                  <th>依据</th><th>备注</th>
+                  <th>批量单号</th><th>依据</th><th>备注</th>
                 </tr>
               </thead>
               <tbody id="releaseRows"></tbody>

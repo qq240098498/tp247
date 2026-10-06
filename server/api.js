@@ -107,6 +107,12 @@ router.get('/batches/:id/release-check', withData((data, req) => {
 }));
 router.post('/batches/:id/decision', withData((data, req) => ({ __save: true, __body: res.decide(data, req.params.id, req.body || {}) })));
 
+// 批量放行：先 /batch-release/precheck 预检（逐批结论与挡下原因+指纹），再 /batch-release/execute 带指纹执行
+router.post('/batch-release/precheck', withData((data, req) => res.batchPrecheck(data, req.body || {})));
+router.post('/batch-release/execute', withData((data, req) => ({ __save: true, __body: res.batchExecute(data, req.body || {}) })));
+router.get('/batch-releases', withData((data, req) => res.listBatchReleases(data, req.query)));
+router.get('/batch-releases/:id', withData((data, req) => res.batchReleaseDetail(data, req.params.id)));
+
 router.get('/records', withData((data, req) => res.listRecords(data, req.query)));
 router.post('/records', withData((data, req) => ({ __save: true, __body: res.createRecord(data, req.body || {}) })));
 router.delete('/records/:id', withData((data, req) => ({ __save: true, __body: res.removeRecord(data, req.params.id) })));

@@ -320,3 +320,63 @@ tr.row-detail > td { background: #f7fbfc; border-bottom: 1px solid var(--line); 
   .layout { flex-direction: column; }
   .filters { width: 100%; flex: 1 1 auto; position: static; }
 }
+
+/* ---------- 批量预检放行 ---------- */
+
+.panel-head-actions { display: flex; align-items: center; gap: 10px; }
+.bulk-note {
+  padding: 7px 12px;
+  font-size: 12px;
+  color: var(--ink-soft);
+  background: #fbfdfe;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.col-check { width: 34px; text-align: center; }
+.col-check input { cursor: pointer; }
+.data-table tbody tr.row-selectable td:first-child { cursor: default; }
+
+.bulk-table-wrap { max-height: 52vh; margin: 8px 0; border: 1px solid var(--line-soft); border-radius: 6px; }
+.bulk-table { width: 100%; background: #fff; }
+.bulk-table th, .bulk-table td { vertical-align: top; }
+tr.bulk-row-ok td { background: var(--ok-soft); }
+tr.bulk-row-bad td { background: var(--accent-soft); }
+
+.bulk-banner {
+  border-radius: 6px;
+  padding: 9px 12px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+  border: 1px solid;
+}
+.bulk-banner-ok { color: var(--ok); background: var(--ok-soft); border-color: #a9d8c4; }
+.bulk-banner-bad { color: var(--accent); background: var(--accent-soft); border-color: #f3b7b0; }
+.bulk-banner .bulk-sub { color: var(--ink); margin-top: 2px; }
+.bulk-intro {
+  background: var(--primary-soft);
+  border: 1px solid #b9d9e3;
+  color: var(--primary-dark);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+.reason-list { margin: 4px 0 0; padding-left: 16px; }
+.reason-list li { color: var(--accent); font-size: 12px; line-height: 1.7; }
+.reason-key {
+  display: inline-block;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 11px;
+  margin-right: 2px;
+}
+.cond-gap { color: var(--accent); font-size: 12px; margin-top: 2px; }
+.bulk-fail-title { font-weight: 700; color: var(--accent); margin: 10px 0 4px; }
+
+/* 批量向导用更宽的弹层 */
+.modal.modal-wide { width: 920px; }
+
+#modalOk:disabled, .btn:disabled { opacity: .55; cursor: not-allowed; }
