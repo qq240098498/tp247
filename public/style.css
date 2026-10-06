@@ -258,6 +258,24 @@ tr.row-detail > td { background: #f7fbfc; border-bottom: 1px solid var(--line); 
 
 .records-note { padding: 6px 12px; color: var(--ink-soft); background: #fbfdfe; border-bottom: 1px solid var(--line-soft); }
 
+/* 批量操作工具条与勾选列 */
+.bulk-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.col-check { width: 34px; text-align: center; }
+.col-check .row-check { width: auto; margin: 0; cursor: pointer; }
+.data-table thead th.col-check { text-align: center; }
+.bulk-table { margin-top: 6px; }
+.bulk-table td:last-child { white-space: normal; min-width: 260px; }
+.bulk-warn { color: var(--accent); font-weight: 600; }
+.stale-banner {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  border: 1px solid #f3b7b0;
+  color: var(--accent);
+  font-size: 13px;
+}
+
 .empty { padding: 14px; color: var(--ink-soft); text-align: center; }
 
 /* 弹层 */

@@ -26,6 +26,9 @@ const state = {
   batchDetailError: {},
   expandedRooms: new Set(),
   expandedBatches: new Set(),
+  selectedBatches: new Set(),
+  bulkPrecheck: null,
+  bulkBusy: false,
   filters: {
     rooms: { status: '', type: '', keyword: '', probeStatus: '', probeCal: 'all' },
     batches: { status: '', roomId: '', product: '', noRecord: false },
@@ -128,6 +131,9 @@ function openModal(title, bodyHtml, okText, onOk) {
   $('modalTitle').textContent = title;
   $('modalBody').innerHTML = bodyHtml;
   $('modalOk').textContent = okText || '保存';
+  $('modalOk').disabled = false;
+  $('modalCancel').hidden = false;
+  $('modalCancel').textContent = '取消';
   modalOnOk = onOk || null;
   $('modalMask').hidden = false;
   const first = $('modalBody').querySelector('input,select,textarea');
@@ -369,11 +375,16 @@ function renderBatchRows() {
   const rows = state.batchesView || [];
   const tbody = $('batchRows');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="13" class="empty">没有符合条件的批次</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="14" class="empty">没有符合条件的批次</td></tr>';
+    syncBulkBar();
     return;
   }
   tbody.innerHTML = rows.map(function (b) {
+    const open = releasableBatch(b);
+    const checkCell = '<td class="col-check"><input type="checkbox" class="row-check" data-action="batch-select" data-id="' + esc(b.id) + '"' +
+      (state.selectedBatches.has(b.id) ? ' checked' : '') + (open ? '' : ' disabled') + '></td>';
     const main = '<tr class="row-main" data-rowkind="batch" data-id="' + esc(b.id) + '">' +
+      checkCell +
       '<td>' + esc(b.code) + '</td>' +
       '<td>' + esc(b.product) + '</td>' +
       '<td>' + esc(b.spec) + '</td>' +
@@ -391,11 +402,68 @@ function renderBatchRows() {
     if (!state.expandedBatches.has(b.id)) return main;
     return main + batchDetailRow(b);
   }).join('');
+  syncBulkBar();
+}
+
+function releasableBatch(b) {
+  return b && (b.status === '在库' || b.status === '待放行');
+}
+
+// 刷新后把已不存在或已不可放行的勾选清掉
+function pruneSelection() {
+  const before = state.selectedBatches.size;
+  state.selectedBatches = new Set(Array.from(state.selectedBatches).filter(function (id) {
+    const b = findBatch(id);
+    return releasableBatch(b);
+  }));
+  if (before !== state.selectedBatches.size) state.bulkPrecheck = null;
+}
+
+function toggleBatchSelect(id, checked) {
+  if (checked) state.selectedBatches.add(id);
+  else state.selectedBatches.delete(id);
+  state.bulkPrecheck = null;
+  syncBulkBar();
+}
+
+function toggleSelectAllRendered(checked) {
+  (state.batchesView || []).forEach(function (b) {
+    if (!releasableBatch(b)) return;
+    if (checked) state.selectedBatches.add(b.id);
+    else state.selectedBatches.delete(b.id);
+  });
+  state.bulkPrecheck = null;
+  renderBatchRows();
+}
+
+function clearSelection() {
+  state.selectedBatches = new Set();
+  state.bulkPrecheck = null;
+  renderBatchRows();
+}
+
+function syncBulkBar() {
+  const n = state.selectedBatches.size;
+  const preBtn = $('bulkPrecheckBtn');
+  const clearBtn = $('bulkClearBtn');
+  if (preBtn) {
+    preBtn.textContent = '批量预检（' + n + '）';
+    preBtn.disabled = n === 0 || state.bulkBusy;
+  }
+  if (clearBtn) clearBtn.disabled = n === 0 || state.bulkBusy;
+  const all = $('batchSelectAll');
+  if (all) {
+    const visible = (state.batchesView || []).filter(releasableBatch);
+    const picked = visible.filter(function (b) { return state.selectedBatches.has(b.id); });
+    all.checked = visible.length > 0 && picked.length === visible.length;
+    all.indeterminate = picked.length > 0 && picked.length < visible.length;
+    all.disabled = visible.length === 0;
+  }
 }
 
 function batchDetailRow(b) {
   const d = state.batchDetail[b.id];
-  if (!d) return '<tr class="row-detail"><td colspan="13"><div class="detail-note">正在读取批次详情…</div></td></tr>';
+  if (!d) return '<tr class="row-detail"><td colspan="14"><div class="detail-note">正在读取批次详情…</div></td></tr>';
   const out = state.batchOut[b.id] || {};
 
   const records = (d.records || []).map(function (r) {
@@ -424,9 +492,8 @@ function batchDetailRow(b) {
   }).join('') || '<tr><td colspan="4" class="empty">没有断链缺口</td></tr>';
 
   const check = d.releaseCheck || {};
-  const conds = (check.conditions || []).slice();
+  const conds = check.conditions || [];
   const expired = check.expiredProbes || [];
-  conds.push({ key: 'calibration', ok: expired.length === 0, value: expired.length, limit: 0, text: '参与判定的探头都在校准有效期内' });
   const condHtml = conds.map(function (c) {
     return '<li><span class="cond-text">' + okPill(c.ok) + ' ' + esc(c.text) + '</span>' +
       '<span class="cond-meta">实际 ' + esc(c.value) + '，阈值 ' + esc(c.limit) + '</span></li>';
@@ -447,7 +514,7 @@ function batchDetailRow(b) {
     '<button type="button" class="btn btn-danger" data-action="batch-del" data-id="' + esc(b.id) + '">删除</button>' +
     '</div>';
 
-  return '<tr class="row-detail"><td colspan="13">' +
+  return '<tr class="row-detail"><td colspan="14">' +
     '<div class="detail-grid">' +
     '<div class="detail-block"><h4>温度记录（' + (d.records || []).length + '）</h4>' +
     '<table class="mini-table"><thead><tr><th>时刻</th><th>探头</th><th class="num">温度(℃)</th><th>来源</th><th>是否超限</th><th>探头是否过期</th></tr></thead><tbody>' + records + '</tbody></table></div>' +
@@ -756,6 +823,177 @@ function openDecisionModal(batch, decision) {
   });
 }
 
+/* ---------- 批量预检与批量放行 ---------- */
+
+const BULK_FAILURE_TEXT = {
+  BATCH_NOT_FOUND: '批次不存在',
+  STALE_PRECHECK: '预检已过期',
+  STATUS_NOT_RELEASABLE: '状态不可放行',
+  PRECHECK_FAILED: '判据不满足'
+};
+
+function setBulkBusy(busy) {
+  state.bulkBusy = busy;
+  syncBulkBar();
+}
+
+function bulkReasonHtml(reasons) {
+  if (!reasons || !reasons.length) return '';
+  return '<ul class="cond-list">' + reasons.map(function (r) {
+    let meta = '';
+    if (r.value !== '' && r.value !== undefined) {
+      meta = '实际 ' + esc(r.value) + '，阈值 ' + esc(r.limit);
+      if (r.shortfall) meta += '，差 ' + esc(r.shortfall) + esc(r.unit || '');
+    }
+    return '<li><span class="cond-text">' + pill('不满足', 'pill-bad') + ' ' + esc(r.text) + '</span>' +
+      '<span class="cond-meta">' + meta + '</span></li>';
+  }).join('') + '</ul>';
+}
+
+function bulkExpiredHtml(probes) {
+  if (!probes || !probes.length) return '';
+  const text = probes.map(function (p) {
+    return esc(p.probeCode) + '（有效期至 ' + esc(p.calibratedUntil) + '）';
+  }).join('、');
+  return '<div class="bulk-warn detail-note">已过校准期的探头：' + text + '</div>';
+}
+
+async function runBulkPrecheck() {
+  const ids = Array.from(state.selectedBatches);
+  if (!ids.length || state.bulkBusy) return;
+  setBulkBusy(true);
+  try {
+    const resp = await api('POST', '/api/batches/bulk-release-check', { batchIds: ids });
+    state.bulkPrecheck = resp;
+    openBulkPrecheckModal(resp);
+  } catch (err) {
+    showError(err);
+  } finally {
+    setBulkBusy(false);
+  }
+}
+
+function openBulkPrecheckModal(resp) {
+  const sum = resp.summary || { total: 0, releasableCount: 0, blockedCount: 0 };
+  const rows = (resp.items || []).map(function (it) {
+    const head = '<tr><td>' + esc(it.batchCode || it.batchId) + '</td>' +
+      '<td>' + esc(it.status || '—') + '</td>' +
+      '<td>' + (it.releasable ? pill('可放行', 'pill-ok') : pill('被挡下', 'pill-bad')) + '</td>' +
+      '<td class="num">' + num(it.recordCount) + '</td>' +
+      '<td>' + bulkReasonHtml(it.reasons) + bulkExpiredHtml(it.expiredProbes) + '</td></tr>';
+    return head;
+  }).join('');
+  const hint = sum.blockedCount > 0
+    ? '<div class="bulk-warn detail-note">有 ' + sum.blockedCount + ' 批被挡下，不能混入批量放行。请取消这些批次的勾选后重新预检，或直接剔除。' +
+      '<div class="detail-actions"><button type="button" class="btn" data-action="batch-bulk-drop-blocked">剔除被挡批次并重检</button></div></div>'
+    : '<div class="detail-note">共 ' + sum.total + ' 批全部满足，预检时刻 ' + esc(resp.checkedAt) + '。</div>';
+  const body = hint +
+    '<table class="mini-table bulk-table"><thead><tr><th>批次号</th><th>状态</th><th>结论</th><th class="num">记录数</th><th>挡下原因（判据 / 实际 / 阈值 / 差值）</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody></table>';
+  openModal('批量预检（共 ' + sum.total + ' 批，可放 ' + sum.releasableCount + '，被挡 ' + sum.blockedCount + '）',
+    body, '确认放行（' + sum.releasableCount + '）', function () {
+      if (sum.blockedCount > 0 || sum.releasableCount === 0) return;
+      openBulkConfirmModal(resp);
+    });
+  $('modalOk').disabled = sum.blockedCount > 0 || sum.releasableCount === 0;
+  $('modalCancel').textContent = '取消';
+}
+
+function openBulkConfirmModal(pre) {
+  const targets = (pre.items || []).filter(function (it) { return it.releasable; });
+  const codes = targets.map(function (it) { return it.batchCode; }).join('、');
+  const body =
+    '<div class="field"><label>经办人</label><input type="text" data-field="decider" value=""></div>' +
+    '<div class="field"><label>依据</label><input type="text" data-field="basis" value=""></div>' +
+    '<div class="field"><label>备注</label><textarea data-field="remark"></textarea></div>' +
+    '<div class="field-hint">本次对以下 ' + targets.length + ' 批统一登记经办信息，各批仍分别生成放行单：' + esc(codes) + '</div>';
+  openModal('确认批量放行 ' + targets.length + ' 批', body, '放行 ' + targets.length + ' 批', async function () {
+    const v = formValues();
+    if (!String(v.decider || '').trim()) {
+      showError({ message: '经办人要填', details: { decider: '经办人不能为空' } });
+      return;
+    }
+    const payload = {
+      decision: '放行',
+      decider: v.decider, basis: v.basis, remark: v.remark,
+      items: targets.map(function (it) { return { batchId: it.batchId, token: it.token }; })
+    };
+    $('modalOk').disabled = true;
+    setBulkBusy(true);
+    try {
+      const resp = await api('POST', '/api/batches/bulk-decision', payload);
+      openBulkResultModal(resp);
+    } catch (err) {
+      if (err && err.code === 'BATCH_BULK_ABORTED') {
+        state.bulkPrecheck = null;
+        pruneSelection();
+        openBulkAbortModal(err);
+        try { await refreshAfterMutation(); } catch (e) { showError(e); }
+      } else {
+        showError(err);
+        $('modalOk').disabled = false;
+      }
+    } finally {
+      setBulkBusy(false);
+    }
+  });
+  $('modalOk').disabled = false;
+}
+
+function openBulkResultModal(resp) {
+  const sum = resp.summary || {};
+  const rows = (resp.results || []).map(function (r) {
+    return '<tr><td>' + esc(r.batchCode) + '</td><td>' + pill(r.status, 'pill-ok') + '</td>' +
+      '<td>' + esc(r.releaseId) + '</td><td>' + esc(r.decider) + '</td><td>' + esc(r.decidedAt) + '</td>' +
+      '<td class="num">' + num(r.mkt) + '</td><td class="num">' + num(r.longestExcursionMinutes) + '</td>' +
+      '<td class="num">' + num(r.chainGapCount) + '</td></tr>';
+  }).join('');
+  const body =
+    '<div class="detail-note">批量放行完成：共请求 ' + num(sum.requested) + ' 批，放行 ' + num(sum.released) +
+    ' 批，失败 ' + num(sum.failed) + ' 批；经办人均为「' + esc(resp.decider) + '」，放行时刻 ' + esc(resp.decidedAt) + '。</div>' +
+    '<table class="mini-table bulk-table"><thead><tr><th>批次号</th><th>结果</th><th>放行单号</th><th>经办人</th><th>时刻</th>' +
+    '<th class="num">MKT</th><th class="num">最长超限</th><th class="num">断链数</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  state.selectedBatches = new Set();
+  state.bulkPrecheck = null;
+  openModal('批量放行结果', body, '完成', async function () {
+    closeModal();
+    try { await refreshAfterMutation(); } catch (err) { showError(err); }
+  });
+  $('modalCancel').hidden = true;
+}
+
+function openBulkAbortModal(err) {
+  const failures = (err.details && err.details.failures) || [];
+  const stale = failures.some(function (f) { return f.code === 'STALE_PRECHECK'; });
+  const banner = stale
+    ? '<div class="stale-banner">预检后有批次被改动（记录补录/删除、判定设置变化、探头校准变更或批次已被处理），本次全部未放行。请重新预检后再放行。</div>'
+    : '<div class="bulk-warn detail-note">批量放行已整体中止，全部批次均未改动。</div>';
+  const rows = failures.map(function (f) {
+    return '<tr><td>' + esc(f.batchCode || f.batchId) + '</td>' +
+      '<td>' + pill(BULK_FAILURE_TEXT[f.code] || f.code || '失败', 'pill-bad') + '</td>' +
+      '<td>' + esc(f.message || '') + bulkReasonHtml(f.reasons) + '</td></tr>';
+  }).join('');
+  const body = banner +
+    '<table class="mini-table bulk-table"><thead><tr><th>批次号</th><th>原因</th><th>说明</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  openModal('批量放行未执行（整批回退）', body, '知道了', function () {
+    closeModal();
+    $('modalCancel').hidden = false;
+  });
+  $('modalCancel').hidden = true;
+}
+
+async function dropBlockedAndRecheck() {
+  const pre = state.bulkPrecheck;
+  if (!pre) { closeModal(); return; }
+  (pre.items || []).forEach(function (it) {
+    if (!it.releasable) state.selectedBatches.delete(it.batchId);
+  });
+  state.bulkPrecheck = null;
+  closeModal();
+  $('modalCancel').hidden = false;
+  await runBulkPrecheck();
+}
+
 function openRecordForm() {
   const now = state.summary && state.summary.today ? state.summary.today + ' 00:00:00' : '';
   const body =
@@ -795,6 +1033,8 @@ async function loadBase() {
 
 async function refreshAfterMutation() {
   try { await loadBase(); } catch (err) { showError(err); }
+  pruneSelection();
+  state.bulkPrecheck = null;
   try {
     const s = await api('GET', '/api/summary');
     state.summary = s;
@@ -876,6 +1116,13 @@ async function handleAction(action, el) {
       if (batch) openDecisionModal(batch, action === 'batch-release' ? '放行' : '拒收');
       return;
     }
+    if (action === 'batch-select') {
+      toggleBatchSelect(el.dataset.id, !!el.checked);
+      return;
+    }
+    if (action === 'batch-bulk-precheck') { await runBulkPrecheck(); return; }
+    if (action === 'batch-bulk-clear') { clearSelection(); return; }
+    if (action === 'batch-bulk-drop-blocked') { await dropBlockedAndRecheck(); return; }
     if (action === 'batch-del') {
       const id = el.dataset.id;
       armDelete(el, async function () {
@@ -937,6 +1184,13 @@ $('modalOk').addEventListener('click', function () {
 });
 $('modalMask').addEventListener('click', function (e) {
   if (e.target === $('modalMask')) closeModal();
+});
+
+$('batchSelectAll').addEventListener('click', function (e) {
+  e.stopPropagation();
+});
+$('batchSelectAll').addEventListener('change', function (e) {
+  toggleSelectAllRendered(!!e.target.checked);
 });
 
 /* ---------- 启动 ---------- */

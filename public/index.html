@@ -96,12 +96,17 @@
         <div class="panel">
           <div class="panel-head">
             <h2>批次清单</h2>
-            <span class="panel-hint">点一行展开温度记录、超限段、断链与放行判定</span>
+            <div class="bulk-bar">
+              <button type="button" class="btn btn-primary" id="bulkPrecheckBtn" data-action="batch-bulk-precheck" disabled>批量预检（0）</button>
+              <button type="button" class="btn" id="bulkClearBtn" data-action="batch-bulk-clear" disabled>清除选择</button>
+              <span class="panel-hint" id="bulkHint">勾选在库/待放行批次后批量预检与放行</span>
+            </div>
           </div>
           <div class="table-wrap">
             <table class="data-table">
               <thead>
                 <tr>
+                  <th class="col-check"><input type="checkbox" id="batchSelectAll" title="全选当前列表中可放行批次"></th>
                   <th>批次号</th><th>品名</th><th>规格</th><th class="num">件数</th><th>所在冷库</th>
                   <th>入库时刻</th><th>状态</th><th class="num">记录数</th><th class="num">最长超限</th>
                   <th class="num">累计超限</th><th class="num">MKT</th><th class="num">断链数</th><th>放行情况</th>

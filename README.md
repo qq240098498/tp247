@@ -41,8 +41,10 @@ npm start
 | PATCH / DELETE | /api/probes/:id | 修改 / 删除 |
 | GET / POST | /api/batches | 批次清单（支持 roomId、status、product）/ 新增 |
 | GET / PATCH / DELETE | /api/batches/:id | 详情（含记录、超限段、断链、放行单）/ 修改 / 删除 |
-| GET | /api/batches/:id/release-check | 这个批次的放行判定 |
+| GET | /api/batches/:id/release-check | 这个批次的放行判定（含预检令牌 `token`） |
 | POST | /api/batches/:id/decision | 放行或者拒收，body `{decision, decider, decidedAt, basis, remark}` |
+| POST | /api/batches/bulk-release-check | 批量预检，body `{batchIds:[...]}`；逐批返回结论、挡下原因（哪条判据、实际值、阈值、差值）与 `token`，并给汇总 |
+| POST | /api/batches/bulk-decision | 批量放行，body `{decision:"放行", decider, basis, remark, items:[{batchId, token}]}`；一个请求内整批提交，任一批不过（含预检过期 `STALE_PRECHECK`）即整体回滚 409 `BATCH_BULK_ABORTED`，成功时逐批返回放行单号并给汇总 |
 | GET / POST | /api/records | 温度记录（支持 batchId、probeId、source、from、to）/ 新增 |
 | DELETE | /api/records/:id | 删除一条记录 |
 | GET | /api/releases | 放行台账（支持 batchId、decision） |

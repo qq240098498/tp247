@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { AppError } = require('./errors');
 const store = require('./store');
 const coldlib = require('./coldlib');
@@ -339,6 +340,23 @@ function listReleases(data, query) {
 }
 
 // 放行：登记放行单并改批次状态
+function buildReleaseRow(data, batch, fields, check) {
+  const c = check || coldlib.releaseCheck(data, batch);
+  return {
+    id: store.nextId('rl', data.releases),
+    batchId: batch.id,
+    decision: fields.decision,
+    decidedAt: fields.decidedAt,
+    decider: fields.decider,
+    mkt: c.mkt,
+    longestExcursionMinutes: c.longestMinutes,
+    totalExcursionMinutes: c.totalMinutes,
+    chainGapCount: c.chain.gapCount,
+    basis: fields.basis,
+    remark: fields.remark,
+  };
+}
+
 function decide(data, batchId, payload) {
   const batch = data.batches.find((b) => b.id === batchId);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
@@ -348,24 +366,216 @@ function decide(data, batchId, payload) {
   if (!String(payload.decider || '').trim()) {
     throw new AppError(400, 'VALIDATION_FAILED', '经办人要填', { decider: '经办人不能为空' });
   }
-  const check = coldlib.releaseCheck(data, batch);
-  const release = {
-    id: store.nextId('rl', data.releases),
-    batchId: batch.id,
+  const release = buildReleaseRow(data, batch, {
     decision: payload.decision,
     decidedAt: String(payload.decidedAt || store.nowText()),
     decider: String(payload.decider).trim(),
-    mkt: check.mkt,
-    longestExcursionMinutes: check.longestMinutes,
-    totalExcursionMinutes: check.totalMinutes,
-    chainGapCount: check.chain.gapCount,
     basis: String(payload.basis || '').trim(),
     remark: String(payload.remark || ''),
-  };
+  });
   data.releases.push(release);
   batch.status = payload.decision === '放行' ? '已放行' : '已拒收';
   batch.decidedAt = release.decidedAt;
   return { release, batch: decorateBatch(data, batch) };
+}
+
+/* ---------- 批量预检与批量放行 ---------- */
+
+const RELEASABLE_STATUS = ['在库', '待放行'];
+const BULK_MAX = 200;
+
+// 确定性 JSON：对象键排序，数组保序，供预检令牌做指纹
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+  return '{' + Object.keys(value).sort()
+    .map((k) => JSON.stringify(k) + ':' + stableStringify(value[k]))
+    .join(',') + '}';
+}
+
+// 预检令牌：覆盖所有能改变放行判定的输入（判定设置、批次状态/放行单数、生效记录、相关探头校准期）
+function precheckToken(data, batch) {
+  const rows = coldlib.effectiveRecords(data, batch.id);
+  const probeIds = Array.from(new Set(rows.map((r) => r.probeId))).sort();
+  const s = data.settings;
+  const fingerprint = {
+    v: 1,
+    settings: {
+      lowerLimitC: Number(s.lowerLimitC),
+      upperLimitC: Number(s.upperLimitC),
+      allowExcursionMinutes: Number(s.allowExcursionMinutes),
+      allowTotalExcursionMinutes: Number(s.allowTotalExcursionMinutes),
+      chainGapMinutes: Number(s.chainGapMinutes),
+      recordIntervalMinutes: Number(s.recordIntervalMinutes),
+    },
+    batch: {
+      status: batch.status,
+      loadedAt: String(batch.loadedAt || ''),
+      releaseCount: data.releases.filter((r) => r.batchId === batch.id).length,
+    },
+    records: rows.map((r) => [r.probeId, String(r.at), Number(r.temperatureC), r.source]),
+    probes: probeIds.map((id) => {
+      const p = coldlib.probeOf(data, id);
+      return [id, p ? String(p.calibratedUntil || '') : null];
+    }),
+  };
+  return crypto.createHash('sha256').update(stableStringify(fingerprint), 'utf8').digest('hex');
+}
+
+// 不满足判据 → 结构化原因：哪一条、实际、阈值、差多少
+function conditionReasons(check) {
+  const gapKeys = { chain: '个', calibration: '个', records: '条' };
+  return check.conditions
+    .filter((c) => !c.ok)
+    .map((c) => ({
+      key: c.key,
+      text: c.text,
+      value: c.value,
+      limit: c.limit,
+      shortfall: c.key === 'records' ? c.limit - c.value : c.value - c.limit,
+      unit: Object.prototype.hasOwnProperty.call(gapKeys, c.key) ? gapKeys[c.key] : '分钟',
+    }));
+}
+
+function normalizeBatchIds(payload) {
+  const raw = payload && payload.batchIds;
+  if (!Array.isArray(raw)) throw new AppError(400, 'VALIDATION_FAILED', '请选择批次', { batchIds: '批次列表必须是数组' });
+  if (!raw.length) throw new AppError(400, 'VALIDATION_FAILED', '至少选择一个批次', { batchIds: '批次列表不能为空' });
+  if (raw.length > BULK_MAX) throw new AppError(400, 'VALIDATION_FAILED', '一次最多 ' + BULK_MAX + ' 个批次', { batchIds: '数量超限' });
+  const ids = raw.map((x) => String(x == null ? '' : x).trim());
+  if (ids.some((x) => !x)) throw new AppError(400, 'VALIDATION_FAILED', '批次编号不能为空', { batchIds: '存在空编号' });
+  const dup = ids.filter((x, i) => ids.indexOf(x) !== i);
+  if (dup.length) {
+    throw new AppError(400, 'VALIDATION_FAILED', '选择了重复批次，请去重后重试', { batchIds: '重复批次：' + Array.from(new Set(dup)).join('、') });
+  }
+  return ids;
+}
+
+function normalizeBulkItems(raw) {
+  if (!Array.isArray(raw) || !raw.length) throw new AppError(400, 'VALIDATION_FAILED', '缺少预检条目', { items: '预检条目必须是非空数组' });
+  if (raw.length > BULK_MAX) throw new AppError(400, 'VALIDATION_FAILED', '一次最多 ' + BULK_MAX + ' 个批次', { items: '数量超限' });
+  const items = raw.map((it) => ({ batchId: String((it && it.batchId) || '').trim(), token: String((it && it.token) || '') }));
+  if (items.some((it) => !it.batchId)) throw new AppError(400, 'VALIDATION_FAILED', '批次编号不能为空', { items: '存在空编号' });
+  const dup = items.map((it) => it.batchId).filter((x, i, arr) => arr.indexOf(x) !== i);
+  if (dup.length) throw new AppError(400, 'VALIDATION_FAILED', '选择了重复批次，请去重后重试', { items: '重复批次：' + Array.from(new Set(dup)).join('、') });
+  return items;
+}
+
+// 批量预检：只读，逐批给结论、挡下原因与令牌
+function bulkReleaseCheck(data, payload) {
+  const ids = normalizeBatchIds(payload);
+  const checkedAt = store.nowText();
+  const items = ids.map((batchId) => {
+    const batch = data.batches.find((b) => b.id === batchId);
+    if (!batch) {
+      return {
+        batchId: batchId, batchCode: '', status: '', pass: false, releasable: false,
+        recordCount: 0, mkt: 0, longestMinutes: 0, totalMinutes: 0, chainGapCount: 0,
+        expiredProbes: [], token: '',
+        reasons: [{ key: 'not_found', text: '批次不存在或已被删除', value: '', limit: '', shortfall: 0, unit: '' }],
+      };
+    }
+    const check = coldlib.releaseCheck(data, batch);
+    const reasons = [];
+    if (!RELEASABLE_STATUS.includes(batch.status)) {
+      reasons.push({ key: 'status', text: '批次状态为「' + batch.status + '」，不能放行', value: batch.status, limit: RELEASABLE_STATUS.join('/'), shortfall: 0, unit: '' });
+    }
+    reasons.push.apply(reasons, conditionReasons(check));
+    return {
+      batchId: batchId,
+      batchCode: batch.code,
+      status: batch.status,
+      pass: check.pass,
+      releasable: RELEASABLE_STATUS.includes(batch.status) && check.pass,
+      recordCount: check.recordCount,
+      mkt: check.mkt,
+      longestMinutes: check.longestMinutes,
+      totalMinutes: check.totalMinutes,
+      chainGapCount: check.chain.gapCount,
+      reasons: reasons,
+      expiredProbes: check.expiredProbes,
+      token: precheckToken(data, batch),
+    };
+  });
+  const blockedCount = items.filter((it) => !it.releasable).length;
+  return {
+    checkedAt: checkedAt,
+    items: items,
+    summary: { total: items.length, releasableCount: items.length - blockedCount, blockedCount: blockedCount },
+  };
+}
+
+// 批量放行：先把整批校验一遍，有一个失败就整体抛错（withData 不写盘 = 整批回滚）；全部通过后一次提交
+function bulkDecide(data, payload) {
+  const body = payload || {};
+  if (body.decision !== '放行') {
+    throw new AppError(400, 'VALIDATION_FAILED', '批量操作只支持放行', { decision: '批量决定必须是放行' });
+  }
+  const decider = String(body.decider || '').trim();
+  if (!decider) throw new AppError(400, 'VALIDATION_FAILED', '经办人要填', { decider: '经办人不能为空' });
+  const basis = String(body.basis || '').trim();
+  const remark = String(body.remark || '');
+  const items = normalizeBulkItems(body.items);
+
+  // 阶段 1：纯校验，零写入
+  const targets = items.map((it) => {
+    const batch = data.batches.find((b) => b.id === it.batchId);
+    if (!batch) {
+      return { batch: null, failure: { batchId: it.batchId, batchCode: '', code: 'BATCH_NOT_FOUND', message: '批次不存在或已被删除', reasons: [] } };
+    }
+    const base = { batchId: batch.id, batchCode: batch.code };
+    if (precheckToken(data, batch) !== it.token) {
+      return { batch: batch, failure: Object.assign({}, base, { code: 'STALE_PRECHECK', message: '预检结果已过期，请重新预检（记录、判定设置、探头校准或批次状态发生了变化）', reasons: [] }) };
+    }
+    if (!RELEASABLE_STATUS.includes(batch.status)) {
+      return { batch: batch, failure: Object.assign({}, base, { code: 'STATUS_NOT_RELEASABLE', message: '批次已被处理，当前状态为「' + batch.status + '」', reasons: [] }) };
+    }
+    const check = coldlib.releaseCheck(data, batch);
+    if (!check.pass) {
+      return { batch: batch, failure: Object.assign({}, base, { code: 'PRECHECK_FAILED', message: '放行判据未全部满足', reasons: conditionReasons(check) }) };
+    }
+    return { batch: batch, check: check };
+  });
+
+  const failures = targets.filter((t) => t.failure).map((t) => Object.assign({ reasons: [] }, t.failure));
+  if (failures.length) {
+    throw new AppError(409, 'BATCH_BULK_ABORTED',
+      '批量放行已整体中止：' + failures.length + ' 个批次不能放行，全部批次均未改动，请调整后重新预检',
+      { failures: failures });
+  }
+
+  // 阶段 2/3：校验已全部通过，逐行生成放行单（nextId 依赖台账当前最大值）并立即登记，再改批次状态；
+  // 此段不再有任何可能抛错的调用
+  const decidedAt = store.nowText();
+  const results = targets.map((t) => {
+    const row = buildReleaseRow(data, t.batch, {
+      decision: '放行', decidedAt: decidedAt, decider: decider, basis: basis, remark: remark,
+    }, t.check);
+    data.releases.push(row);
+    t.batch.status = '已放行';
+    t.batch.decidedAt = decidedAt;
+    return {
+      batchId: t.batch.id,
+      batchCode: t.batch.code,
+      releaseId: row.id,
+      status: '已放行',
+      decidedAt: decidedAt,
+      decider: decider,
+      mkt: row.mkt,
+      longestExcursionMinutes: row.longestExcursionMinutes,
+      totalExcursionMinutes: row.totalExcursionMinutes,
+      chainGapCount: row.chainGapCount,
+    };
+  });
+  return {
+    decidedAt: decidedAt,
+    decider: decider,
+    decision: '放行',
+    basis: basis,
+    remark: remark,
+    results: results,
+    summary: { requested: targets.length, released: targets.length, failed: 0 },
+  };
 }
 
 module.exports = {
@@ -374,5 +584,6 @@ module.exports = {
   listBatches, batchDetail, createBatch, updateBatch, removeBatch,
   listRecords, createRecord, removeRecord,
   listReleases, decide,
+  precheckToken, bulkReleaseCheck, bulkDecide,
   ROOM_STATUS, ROOM_TYPE, PROBE_STATUS, BATCH_STATUS, SOURCE_LIST,
 };

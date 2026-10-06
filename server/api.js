@@ -97,13 +97,15 @@ router.delete('/probes/:id', withData((data, req) => ({ __save: true, __body: re
 
 router.get('/batches', withData((data, req) => res.listBatches(data, req.query)));
 router.post('/batches', withData((data, req) => ({ __save: true, __body: res.createBatch(data, req.body || {}) })));
+router.post('/batches/bulk-release-check', withData((data, req) => res.bulkReleaseCheck(data, req.body || {})));
+router.post('/batches/bulk-decision', withData((data, req) => ({ __save: true, __body: res.bulkDecide(data, req.body || {}) })));
 router.get('/batches/:id', withData((data, req) => res.batchDetail(data, req.params.id)));
 router.patch('/batches/:id', withData((data, req) => ({ __save: true, __body: res.updateBatch(data, req.params.id, req.body || {}) })));
 router.delete('/batches/:id', withData((data, req) => ({ __save: true, __body: res.removeBatch(data, req.params.id) })));
 router.get('/batches/:id/release-check', withData((data, req) => {
   const batch = data.batches.find((b) => b.id === req.params.id);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
-  return coldlib.releaseCheck(data, batch);
+  return Object.assign({}, coldlib.releaseCheck(data, batch), { token: res.precheckToken(data, batch) });
 }));
 router.post('/batches/:id/decision', withData((data, req) => ({ __save: true, __body: res.decide(data, req.params.id, req.body || {}) })));
 

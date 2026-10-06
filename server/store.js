@@ -42,7 +42,10 @@ function load() {
 }
 
 function save(data) {
-  fs.writeFileSync(dataFile, JSON.stringify(data, null, 2), 'utf8');
+  // 同目录临时文件 + rename：POSIX 下替换是原子的，避免崩溃写到一半弄坏 db.json
+  const tmp = dataFile + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(tmp, dataFile);
 }
 
 function nextId(prefix, list) {
